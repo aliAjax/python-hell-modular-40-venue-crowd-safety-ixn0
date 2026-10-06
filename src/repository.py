@@ -200,3 +200,102 @@ class SQLiteRepository:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+    def _swap(self, connection, entity_id, expected_version, new_status, new_data, now):
+        """Compare-and-swap a single entity inside an open transaction.
+
+        Raises ConflictError when the row version has moved on, so a late
+        coordinator cannot silently overwrite a merge that committed first.
+        """
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        payload = json.dumps(new_data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (new_status, payload, now, entity_id, current_version),
+        )
+
+    def _swap_data(self, connection, entity_id, expected_version, new_data, now):
+        """Compare-and-swap only the data payload (status unchanged)."""
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        payload = json.dumps(new_data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "UPDATE entities SET version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (payload, now, entity_id, current_version),
+        )
+
+    def apply_merge(self, *, merge_row, main_update, source_updates, task_updates):
+        """Atomically commit a merge: re-rate the main, mark sources merged,
+        move draft tasks onto the main, and insert the merge ledger row."""
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._swap(connection, main_update[0], main_update[1], main_update[2], main_update[3], now)
+            for source_id, expected_version, new_status, new_data in source_updates:
+                self._swap(connection, source_id, expected_version, new_status, new_data, now)
+            for task_id, expected_version, new_data in task_updates:
+                self._swap_data(connection, task_id, expected_version, new_data, now)
+            payload = json.dumps(merge_row["data"], ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                (
+                    merge_row["id"],
+                    merge_row["kind"],
+                    merge_row["status"],
+                    payload,
+                    merge_row["created_by"],
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(merge_row["id"])
+
+    def apply_cancel(self, *, merge_update, main_restore, source_restores, task_restores):
+        """Atomically undo a merge: mark the ledger cancelled and restore the
+        main, the sources and the transferred tasks to their prior state."""
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._swap(connection, merge_update[0], merge_update[1], merge_update[2], merge_update[3], now)
+            self._swap(connection, main_restore[0], main_restore[1], main_restore[2], main_restore[3], now)
+            for source_id, expected_version, restore_status, new_data in source_restores:
+                self._swap(connection, source_id, expected_version, restore_status, new_data, now)
+            for task_id, expected_version, new_data in task_restores:
+                self._swap_data(connection, task_id, expected_version, new_data, now)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(merge_update[0])

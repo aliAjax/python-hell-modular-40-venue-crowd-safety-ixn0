@@ -32,6 +32,13 @@ python3 app.py --db ./data.db --port 8340
 - `POST /api/entities/<id>/actions`
 - `GET /api/audit`
 
+事件归并（同一现场状况的多个来源合并为一个主事件）：
+
+- `GET /api/incidents/pending`：待归并台账，列出尚未归并的事件来源。
+- `POST /api/incidents/merge`：协调员选主事件并归并。请求体`{"main_incident_id": ..., "source_incident_ids": [...]}`，可带`Idempotency-Key`断网重试。归并后按最高严重度重新定级，未执行（草稿）任务转到主事件，已派出任务保留在原来源、不重复生成。
+- `POST /api/incident-merges/<id>/cancel`：撤销归并，恢复原事件与任务。仅协调员可撤销；请求体`{"reason": ..., "expected_version": ...}`支持乐观锁版本控制。
+- `GET /api/incidents/<id>/detail`：事件详情，显示主事件、来源清单和未决任务数（归并事件统计整个归并的未决任务）。
+
 身份通过`X-User-Id`和`X-Role`请求头传入。可选`Idempotency-Key`防止重复创建。
 
 ## 测试

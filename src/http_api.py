@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "incidents", "pending"]:
+                    return self._send(200, {"items": service.pending_sources(self._actor())})
+                if len(parts) == 4 and parts[:2] == ["api", "incidents"] and parts[3] == "detail":
+                    return self._send(200, service.incident_detail(self._actor(), parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -137,6 +141,28 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if parts == ["api", "incidents", "merge"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.merge_incidents(
+                            actor,
+                            body.get("main_incident_id"),
+                            body.get("source_incident_ids") or [],
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "incident-merges"] and parts[3] == "cancel":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.cancel_merge(
+                            actor,
+                            parts[2],
+                            body.get("reason"),
+                            body.get("expected_version"),
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()

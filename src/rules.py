@@ -8,6 +8,23 @@ def _find_one(lookup, kind, field, value):
     return rows[0] if rows else None
 
 
+SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def max_severity(severities):
+    """Return the highest severity by rank; reject unknown severities."""
+    best = None
+    best_rank = -1
+    for severity in severities:
+        rank = SEVERITY_RANK.get(severity)
+        if rank is None:
+            raise ValidationError("unsupported severity: " + str(severity))
+        if rank > best_rank:
+            best_rank = rank
+            best = severity
+    return best
+
+
 def incident_priority(severity, incident_type):
     severity_scores = {"low": 10, "medium": 30, "high": 60, "critical": 90}
     type_bonus = {
@@ -155,6 +172,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "incident_merges": "incident_merge",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +182,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "incident_merge": "active",
     }
     TRANSITIONS = {
         "venue": {
