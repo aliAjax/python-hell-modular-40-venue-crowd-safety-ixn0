@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -53,6 +54,17 @@ class SQLiteRepository:
                     entity_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
+                );
+                CREATE TABLE IF NOT EXISTS source_registry (
+                    venue_id TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    incident_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    merge_record_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(venue_id, source_ref)
                 );
             """)
 
@@ -200,3 +212,205 @@ class SQLiteRepository:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+    # ---- 事件归并：来源登记表 ---------------------------------------------
+
+    def register_source(self, venue_id, source_ref, incident_id, channel):
+        now = utcnow()
+        with self._connect() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO source_registry(venue_id, source_ref, incident_id, channel, "
+                    "status, merge_record_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)",
+                    (venue_id, source_ref, incident_id, channel, now, now),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError(
+                    "source already registered: %s:%s" % (venue_id, source_ref)
+                )
+        return self.get_source(venue_id, source_ref)
+
+    def get_source(self, venue_id, source_ref):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM source_registry WHERE venue_id = ? AND source_ref = ?",
+                (venue_id, source_ref),
+            ).fetchone()
+        return self._source_from_row(row) if row else None
+
+    def list_sources(self, venue_id=None, status=None):
+        clauses = []
+        params = []
+        if venue_id:
+            clauses.append("venue_id = ?")
+            params.append(venue_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM source_registry" + where + " ORDER BY created_at, incident_id",
+                params,
+            ).fetchall()
+        return [self._source_from_row(row) for row in rows]
+
+    @staticmethod
+    def _source_from_row(row):
+        return {
+            "venue_id": row["venue_id"],
+            "source_ref": row["source_ref"],
+            "incident_id": row["incident_id"],
+            "channel": row["channel"],
+            "status": row["status"],
+            "merge_record_id": row["merge_record_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @contextlib.contextmanager
+    def unit_of_work(self):
+        """单连接事务，供归并/撤销原子改写多个实体。"""
+        connection = self._connect()
+        uow = UnitOfWork(connection)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield uow
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+class UnitOfWork:
+    """一次事务内对实体、来源登记、审计和幂等键的全部读写。"""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    @staticmethod
+    def _entity_from_row(row):
+        return SQLiteRepository._entity_from_row(row)
+
+    @staticmethod
+    def _source_from_row(row):
+        return SQLiteRepository._source_from_row(row)
+
+    def get_entity(self, entity_id):
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self._entity_from_row(row) if row else None
+
+    def list_by_field(self, kind, field, value):
+        rows = self.connection.execute(
+            "SELECT * FROM entities WHERE kind = ? ORDER BY created_at, id", (kind,)
+        ).fetchall()
+        entities = [self._entity_from_row(row) for row in rows]
+        if field == "id":
+            return [entity for entity in entities if entity["id"] == value]
+        return [entity for entity in entities if entity["data"].get(field) == value]
+
+    def create_entity(self, entity_id, kind, status, data, actor_id):
+        now = utcnow()
+        self.connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (
+                entity_id,
+                kind,
+                status,
+                json.dumps(data, ensure_ascii=False, sort_keys=True),
+                actor_id,
+                now,
+                now,
+            ),
+        )
+        return self.get_entity(entity_id)
+
+    def update_entity(self, entity_id, expected_version, status, data):
+        now = utcnow()
+        row = self.connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        self.connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                status,
+                json.dumps(data, ensure_ascii=False, sort_keys=True),
+                now,
+                entity_id,
+            ),
+        )
+        return self.get_entity(entity_id)
+
+    def get_source(self, venue_id, source_ref):
+        row = self.connection.execute(
+            "SELECT * FROM source_registry WHERE venue_id = ? AND source_ref = ?",
+            (venue_id, source_ref),
+        ).fetchone()
+        return self._source_from_row(row) if row else None
+
+    def register_source(self, venue_id, source_ref, incident_id, channel):
+        now = utcnow()
+        try:
+            self.connection.execute(
+                "INSERT INTO source_registry(venue_id, source_ref, incident_id, channel, "
+                "status, merge_record_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)",
+                (venue_id, source_ref, incident_id, channel, now, now),
+            )
+        except sqlite3.IntegrityError:
+            raise ConflictError(
+                "source already registered: %s:%s" % (venue_id, source_ref)
+            )
+        return self.get_source(venue_id, source_ref)
+
+    def mark_source(self, venue_id, source_ref, status, merge_record_id):
+        self.connection.execute(
+            "UPDATE source_registry SET status = ?, merge_record_id = ?, updated_at = ? "
+            "WHERE venue_id = ? AND source_ref = ?",
+            (status, merge_record_id, utcnow(), venue_id, source_ref),
+        )
+
+    def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
+
+    def save_idempotency(self, actor_id, idem_key, entity_id):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (actor_id, idem_key, entity_id, utcnow()),
+        )
+
+    def get_idempotency(self, actor_id, idem_key):
+        row = self.connection.execute(
+            "SELECT entity_id FROM idempotency WHERE actor_id = ? AND idem_key = ?",
+            (actor_id, idem_key),
+        ).fetchone()
+        return row["entity_id"] if row else None

@@ -14,13 +14,17 @@
 <body>
 <main>
   <h1>大型场馆人群安全与现场指挥</h1>
-  <p>区域容量、入口通道、事件、现场任务和人员到位通过JSON接口管理。</p>
+  <p>区域容量、入口通道、事件、现场任务和人员到位通过JSON接口管理。多来源（对讲机/视频/电话）事件先入待归并台账，由本场馆协调员选主归并。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
+GET  /api/sources
+POST /api/incidents/merge
+POST /api/merge-records/&lt;id&gt;/unmerge
+GET  /api/incidents/&lt;id&gt;
 GET  /api/audit</pre>
 </main>
 <script>

@@ -1,5 +1,21 @@
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
+SEVERITY_ORDER = ("low", "medium", "high", "critical")
+SOURCE_CHANNELS = ("radio", "video", "phone", "manual")
+
+
+def max_severity(*severities):
+    """取一组严重度中的最高级；非法值触发校验错误。"""
+    result = None
+    for severity in severities:
+        if severity is None:
+            continue
+        if severity not in SEVERITY_ORDER:
+            raise ValidationError("unsupported severity")
+        if result is None or SEVERITY_ORDER.index(severity) > SEVERITY_ORDER.index(result):
+            result = severity
+    return result
+
 
 def _find_one(lookup, kind, field, value):
     if lookup is None:
@@ -30,7 +46,12 @@ def capacity_available(capacity, occupancy, requested):
 def _validate_venue(actor, data, lookup):
     if not str(data.get("name", "")).strip():
         raise ValidationError("venue name is required")
-    return {}
+    coordinator_ids = data.get("coordinator_ids") or []
+    if not isinstance(coordinator_ids, list) or not all(
+        str(item).strip() for item in coordinator_ids
+    ):
+        raise ValidationError("coordinator_ids must be a list of user ids")
+    return {"coordinator_ids": coordinator_ids}
 
 
 def _validate_zone(actor, data, lookup):
@@ -77,10 +98,14 @@ def _validate_incident(actor, data, lookup):
     zone = _find_one(lookup, "zone", "id", data.get("zone_id"))
     if not zone or zone["data"].get("venue_id") != data.get("venue_id"):
         raise ValidationError("incident zone must belong to the venue")
+    channel = data.get("channel") or "radio"
+    if channel not in SOURCE_CHANNELS:
+        raise ValidationError("unsupported source channel: " + str(channel))
     incident_key = "%s:%s" % (data["venue_id"], data["source_ref"])
     if _find_one(lookup, "incident", "incident_key", incident_key):
         raise ConflictError("duplicate incident source reference: " + incident_key)
     return {
+        "channel": channel,
         "incident_key": incident_key,
         "priority_score": incident_priority(data.get("severity"), data.get("incident_type")),
     }
@@ -90,6 +115,8 @@ def _validate_task(actor, data, lookup):
     incident = _find_one(lookup, "incident", "id", data.get("incident_id"))
     if not incident or incident["data"].get("venue_id") != data.get("venue_id"):
         raise ValidationError("task incident must belong to the venue")
+    if incident["status"] == "merged":
+        raise ConflictError("cannot create tasks for a merged incident; use the main incident")
     if not _find_one(lookup, "zone", "id", data.get("zone_id")):
         raise ValidationError("task zone does not exist")
     return {}
@@ -128,6 +155,19 @@ def _validate_gate_open(actor, entity, data, lookup):
         if zone and zone["status"] == "evacuating":
             raise ConflictError("gate cannot open while a connected zone is evacuating")
     return {"opened_by": actor.user_id}
+
+
+def _validate_venue_assign_coordinators(actor, entity, data, lookup):
+    coordinator_ids = data.get("coordinator_ids")
+    if not isinstance(coordinator_ids, list) or not coordinator_ids or not all(
+        str(item).strip() for item in coordinator_ids
+    ):
+        raise ValidationError("coordinator_ids must be a non-empty list of user ids")
+    # 仅本场馆已登记的协调员或管理员可再次登记，首次登记由建馆时的管理员完成。
+    existing = entity["data"].get("coordinator_ids") or []
+    if existing and actor.user_id not in existing and actor.role != "admin":
+        raise PermissionDenied("only a venue coordinator or admin can update coordinators")
+    return {"coordinator_ids": coordinator_ids}
 
 
 def _validate_task_assign(actor, entity, data, lookup):
@@ -170,6 +210,10 @@ class RuleEngine:
             "limit": (("ready",), "limited"),
             "close": (("ready", "limited"), "closed"),
             "reopen": (("limited", "closed"), "ready"),
+            "assign_coordinators": (
+                ("ready", "limited", "closed"),
+                None,
+            ),
         },
         "zone": {
             "open": (("closed",), "open"),
@@ -200,6 +244,7 @@ class RuleEngine:
             "dispatch": (("triaged",), "dispatched"),
             "resolve": (("dispatched", "reopened"), "resolved"),
             "reopen": (("resolved",), "reopened"),
+            "merge": (("reported", "triaged", "dispatched", "reopened"), "merged"),
             "correct": (("reported", "triaged", "dispatched", "resolved", "reopened"), "triaged"),
         },
         "task": {
@@ -222,6 +267,7 @@ class RuleEngine:
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
         ("venue", "close"): ("reason",),
+        ("venue", "assign_coordinators"): ("coordinator_ids",),
         ("zone", "admit"): ("gate_id", "count", "admitted_at"),
         ("zone", "restrict"): ("reason", "admit_limit"),
         ("zone", "evacuate"): ("reason",),
@@ -258,6 +304,7 @@ class RuleEngine:
         "limit": ("coordinator", "supervisor", "admin"),
         "close": ("coordinator", "supervisor", "admin"),
         "reopen": ("coordinator", "admin"),
+        "assign_coordinators": ("coordinator", "admin"),
         "open": ("operator", "supervisor", "coordinator", "admin"),
         "admit": ("operator", "supervisor", "admin"),
         "restrict": ("supervisor", "coordinator", "admin"),
@@ -292,6 +339,7 @@ class RuleEngine:
         ("gate", "open"): _validate_gate_open,
         ("incident", "correct"): _validate_correct,
         ("task", "assign"): _validate_task_assign,
+        ("venue", "assign_coordinators"): _validate_venue_assign_coordinators,
     }
 
     def normalize_kind(self, kind):
@@ -340,4 +388,4 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status or entity["status"], patch

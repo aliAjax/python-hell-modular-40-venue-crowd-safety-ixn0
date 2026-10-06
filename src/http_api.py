@@ -84,6 +84,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "sources"]:
+                    query = parse_qs(parsed.query)
+                    return self._send(200, {
+                        "items": service.pending_sources(
+                            include_merged=query.get("include_merged", ["false"])[0] == "true",
+                            venue_id=query.get("venue_id", [None])[0],
+                        )
+                    })
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -103,6 +111,34 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "incidents", "merge"]:
+                    body = self._body()
+                    primary_id = body.pop("primary_incident_id", None)
+                    source_ids = body.pop("source_incident_ids", None)
+                    if not primary_id:
+                        raise ValidationError("primary_incident_id is required")
+                    if not isinstance(source_ids, list) or not source_ids:
+                        raise ValidationError("source_incident_ids must be a non-empty list")
+                    return self._send(
+                        200,
+                        service.merge_incidents(
+                            actor,
+                            primary_id,
+                            source_ids,
+                            body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "merge-records"] and parts[3] == "unmerge":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.unmerge_incidents(
+                            actor,
+                            parts[2],
+                            body.pop("expected_version", None),
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
